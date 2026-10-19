@@ -1,5 +1,5 @@
 // Le mie uscite: copia offline dell'app. Cambia VERSION quando aggiorni i file.
-const VERSION = "uscite-v1";
+const VERSION = "uscite-v2";
 const ASSETS = ["./", "./index.html", "./manifest.webmanifest", "./xlsx.full.min.js", "./chart.umd.js",
   "./icon-192.png", "./icon-512.png", "./icon-maskable.png"];
 

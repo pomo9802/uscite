@@ -200,6 +200,18 @@ textarea.inp{min-height:180px;font-size:12px;font-family:ui-monospace,Menlo,mono
 .catrow:first-child{border-top:0}
 .catrow .nm{flex:1;min-width:0}
 .chip.add{border-style:dashed;color:var(--muted)}
+.titlerow{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
+.linkbtn{border:0;background:transparent;color:var(--accent);font-weight:600;padding:4px 0;font-size:14px;flex:none}
+.det .linkbtn{font-size:13px;padding:0 0 0 4px}
+.warnt{color:var(--wait)}
+.sw.used{position:relative;opacity:.45}
+.sw.used::after{content:"";position:absolute;left:50%;top:4px;bottom:4px;width:2px;background:var(--surface);transform:translateX(-50%) rotate(45deg)}
+.cd{display:block;font-size:12px;color:var(--muted);font-weight:500}
+.cd.up{color:var(--danger)} .cd.down{color:var(--ok)}
+.bh{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+.bh h2{margin:0}
+.bh select.chip{max-width:55%;text-overflow:ellipsis}
+.chip.on{background:var(--ink);color:var(--bg);border-color:var(--ink);display:inline-flex;align-items:center;gap:6px}
 .toast{position:fixed;left:50%;bottom:calc(92px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:12px;font-size:14px;z-index:30;opacity:0;pointer-events:none;transition:opacity .2s;max-width:90%;text-align:center}
 .toast.show{opacity:1}
 </style>
@@ -341,6 +353,39 @@ function merchantName(op, det){
   s = s.replace(/\*/g, " ").replace(/\s+/g, " ").trim();
   return titleCase(s || "Senza nome");
 }
+/* Ripulisce il nome del negozio: toglie città, vie troncate, numeri di cassa, forme societarie, codici PagoPA. */
+const CITY_TAIL = ["san francisco","dublin","dublino","london","londra","luxembourg","lussemburgo","amsterdam","paris","parigi","puteaux","berlin","madrid","barcelona",
+  "roma","milano","torino","napoli","genova","bologna","firenze","venezia","verona","padova","vicenza","treviso","rovigo","ferrara","modena","parma","brescia","bergamo",
+  "trento","trieste","udine","ancona","pesaro","rimini","ravenna","salerno","bari","palermo","catania","cagliari","pisa","livorno","mestre","castelfidardo","internet"];
+const BRANDS = [
+  [/^mc ?donald'?s\b/i, "McDonald's"],
+  [/^bspdv\b/i, "Autostrada Brescia-Padova"],
+  [/pagopa/i, "PagoPA"]
+];
+function cleanName(raw){
+  let s = normTxt(raw);
+  if (!s) return "Senza nome";
+  s = s.replace(/^\d+\s+(?=\D)/, "");
+  for (const [re, name] of BRANDS){ if (re.test(s) && !/commission/i.test(s)) return name; }
+  s = s.replace(/^(sumup|zettle_?|sq|sp|paypal)\s+/i, "").replace(/^www\./i, "");
+  s = s.replace(/\s+(via|viale|v\.le|piazza|p\.za|p\.zza|corso|c\.so|strada|loc\.?)(\s.*)?$/i, "");
+  s = s.replace(/\s+(s\.?r\.?l\.?s?|s\.?p\.?a\.?|s\.?n\.?c\.?|s\.?a\.?s\.?|gmbh|ltd|payments)(\s.*)?$/i, "");
+  let t = s.split(" ").filter(Boolean);
+  const lc = () => t.join(" ").toLowerCase();
+  let changed = true;
+  while (changed && t.length > 1){
+    changed = false;
+    const last = t[t.length - 1], ll = last.toLowerCase().replace(/[.,]+$/, "");
+    if (/^(n\.?|nr\.?|pv|#)?\d+$/i.test(ll) || ll === ".." || ll === "-"){ t.pop(); changed = true; continue; }
+    const city = CITY_TAIL.find(c => lc().endsWith(" " + c) && c.split(" ").length < t.length);
+    if (city){ t.splice(t.length - city.split(" ").length); changed = true; continue; }
+    const earlier = t.slice(0, -1).map(x => x.toLowerCase());
+    if (ll && earlier.some(e => e.startsWith(ll))){ t.pop(); changed = true; continue; }
+  }
+  while (t.length > 1 && /^\d+$/.test(t[0])) t.shift();
+  const out = t.join(" ") || normTxt(raw);
+  return out.charAt(0).toUpperCase() + out.slice(1);
+}
 // PARSER END
 
 /* ---------- categorie ---------- */
@@ -383,16 +428,39 @@ const DEFAULT_RULES = [ { kw:"AMAZON", cat:"shopping" }, { kw:"ZALANDO", cat:"sh
 
 /* ---------- stato ---------- */
 const STORE_KEY = "le-mie-uscite.v1";
-let S = { movements:[], overrides:{}, rules: DEFAULT_RULES.slice(), imports:[], cats:null, catRemap:{} };
-const UI = { tab:"panoramica", mode:"mese", ym:null, from:null, to:null, q:"", cat:"", flt:"tutte", limit:150 };
+const emptyState0 = () => ({ movements:[], overrides:{}, rules: DEFAULT_RULES.map(r => Object.assign({}, r)), imports:[], cats:null, catRemap:{}, names:{}, rulesV:2, colorsV:1 });
+let S = emptyState0();
+const UI = { tab:"panoramica", mode:"mese", ym:null, from:null, to:null, q:"", cat:"", flt:"tutte", limit:150, barCat:"" };
 let charts = [];
 
 function load(){
   try {
     const raw = localStorage.getItem(STORE_KEY);
-    if (raw){ const d = JSON.parse(raw); S = Object.assign({ movements:[], overrides:{}, rules:[], imports:[], cats:null, catRemap:{} }, d); }
+    if (raw){ const d = JSON.parse(raw); S = Object.assign({ movements:[], overrides:{}, rules:[], imports:[], cats:null, catRemap:{}, names:{} }, d); }
   } catch (e) { /* archivio vuoto o non leggibile */ }
-  syncCats();
+  syncCats(); migrate(); refreshNames();
+}
+/* Aggiorna i dati salvati con versioni precedenti dell'app. */
+function migrate(){
+  if (!S.names || typeof S.names !== "object") S.names = {};
+  if ((S.rulesV || 1) < 2){
+    // le parole chiave delle regole vecchie contenevano città e numeri: le ripulisco
+    for (const r of S.rules){ const k = normKw(cleanName(r.kw)); if (k) r.kw = k; }
+    const seen = new Set(); S.rules = S.rules.filter(r => !seen.has(r.kw) && seen.add(r.kw));
+    S.rulesV = 2;
+  }
+  if ((S.colorsV || 0) < 1){
+    // due categorie con lo stesso colore: la più recente prende un colore libero
+    const used = new Set();
+    for (const c of S.cats){
+      if (used.has(c.color)){ const free = PALETTE.find(p => !used.has(p) && !S.cats.some(x => x.color === p)); if (free) c.color = free; }
+      used.add(c.color);
+    }
+    S.colorsV = 1;
+  }
+}
+function refreshNames(){
+  for (const m of S.movements){ m.raw = merchantName(m.op, m.det); m.clean = cleanName(m.raw); m.mer = S.names[m.clean] || m.clean; }
 }
 function save(){
   try { localStorage.setItem(STORE_KEY, JSON.stringify(S)); return true; }
@@ -417,18 +485,51 @@ function daysBetween(a, b){ return Math.round((Date.parse(b) - Date.parse(a)) / 
 function cssVar(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
 
 function ov(m){ return S.overrides[m.id] || {}; }
-function baseCat(m){
-  const txt = (m.op + " " + m.det + " " + (m.mer || "")).toUpperCase();
-  for (const r of S.rules){ if (r.kw && txt.includes(r.kw.toUpperCase())) return resolveCat(r.cat); }
+function normKw(s){ return String(s == null ? "" : s).toUpperCase().replace(/[*_]/g, " ").replace(/\s+/g, " ").trim(); }
+function mvText(m){ return normKw([m.op, m.det, m.raw, m.clean, m.mer].join(" ")); }
+// le regole più specifiche (parola più lunga) vincono: «AMAZON PRIME» prima di «AMAZON»
+function sortedRules(){ return S.rules.filter(r => r.kw).slice().sort((a,b) => b.kw.length - a.kw.length); }
+function ruleFor(m, rules){
+  const txt = mvText(m);
+  for (const r of (rules || sortedRules())){ if (txt.includes(normKw(r.kw))) return r; }
+  return null;
+}
+function bankCatId(m){
   for (const [re, id] of BANK_MAP){ if (re.test(m.bankCat || "")) return resolveCat(id); }
   return "altro";
 }
+function baseCat(m){ const r = ruleFor(m); return r ? resolveCat(r.cat) : bankCatId(m); }
 function catOf(m){ const o = ov(m); return o.cat ? resolveCat(o.cat) : baseCat(m); }
+/* da dove arriva la categoria di una spesa */
+function catSource(m){
+  const o = ov(m);
+  if (o.cat) return { type:"manual" };
+  const r = ruleFor(m);
+  if (r) return { type:"rule", rule:r };
+  const id = bankCatId(m);
+  return id === "altro" && !BANK_MAP.some(([re]) => re.test(m.bankCat || "")) ? { type:"none" } : { type:"bank" };
+}
+function ruleMatches(kw){ const k = normKw(kw); return k ? S.movements.filter(m => mvText(m).includes(k)) : []; }
 function reimbOf(m){ const o = ov(m); return o.reimb ? Math.min(o.reimb.amount, m.amount) : 0; }
 function netOf(m){ return r2(m.amount - reimbOf(m)); }
 function isPending(m){ const o = ov(m); return !!(o.reimb && o.reimb.state === "atteso"); }
 function isOneoff(m){ return !!ov(m).oneoff; }
 
+/* spese che sembrano una tantum: tasse sul reddito, F24, o importi alti. Le propongo finché non rispondi. */
+const ONEOFF_MIN = 200;
+function oneoffSuggested(m){
+  const o = ov(m);
+  if (o.oneoff || o.ooSeen || netOf(m) <= 0) return false;
+  return /imposte sul reddito|tasse varie/i.test(m.bankCat || "") || /\bf24\b/i.test(m.op + " " + m.det) || netOf(m) >= ONEOFF_MIN;
+}
+/* percentuali arrotondate che sommano sempre a 100 (metodo dei resti più grandi) */
+function pcts100(vals){
+  const tot = vals.reduce((a,b) => a + b, 0); if (tot <= 0) return vals.map(() => 0);
+  const raw = vals.map(v => v / tot * 100), fl = raw.map(Math.floor);
+  let left = 100 - fl.reduce((a,b) => a + b, 0);
+  raw.map((v,i) => [v - fl[i], i]).sort((a,b) => b[0] - a[0]).forEach(([,i]) => { if (left > 0){ fl[i]++; left--; } });
+  return fl;
+}
 function months(){ return [...new Set(S.movements.map(m => ymOf(m.date)))].sort(); }
 function coverage(){
   const iv = S.imports.filter(i => i.from && i.to).map(i => [i.from, i.to]).sort((a,b) => a[0].localeCompare(b[0]));
@@ -506,6 +607,7 @@ function render(){
   const badge = $("#badge"); badge.hidden = pend.length === 0; badge.textContent = pend.length;
 
   const main = $("#main");
+  if (UI.cat && !CAT[UI.cat]) UI.cat = "";
   if (UI.tab === "panoramica") main.innerHTML = renderPanoramica(ms);
   else if (UI.tab === "movimenti") main.innerHTML = renderMovimenti(ms);
   else if (UI.tab === "recuperare") main.innerHTML = renderRecuperare();
@@ -602,12 +704,46 @@ function renderPanoramica(ms){
   const byCat = {};
   for (const m of list){ const n = netOf(m); if (n <= 0) continue; const c = catOf(m); byCat[c] = (byCat[c] || 0) + n; }
   const cats = Object.entries(byCat).sort((a,b) => b[1] - a[1]);
+  const pc = pcts100(cats.map(c => c[1]));
+  // confronto con lo stesso periodo del mese prima, categoria per categoria
+  let prevCat = null, prevLabel = "";
+  if (UI.mode === "mese"){
+    const prev = addMonths(UI.ym, -1);
+    const covOk = cov.from && cov.from <= prev + "-01";
+    if (covOk){
+      const partial = cov.to && ymOf(cov.to) === UI.ym && Number(cov.to.slice(8,10)) < daysInMonth(UI.ym);
+      const cutDay = partial ? Number(cov.to.slice(8,10)) : 31;
+      prevCat = {};
+      for (const m of S.movements){ if (ymOf(m.date) !== prev || Number(m.date.slice(8,10)) > cutDay) continue; const n = netOf(m); if (n <= 0) continue; const c = catOf(m); prevCat[c] = (prevCat[c] || 0) + n; }
+      prevLabel = monthShort(prev);
+    }
+  }
+  const delta = id => {
+    if (!prevCat) return "";
+    const now = byCat[id] || 0, was = prevCat[id] || 0;
+    if (was <= 0) return `<span class="cd">nuova rispetto a ${esc(prevLabel)}</span>`;
+    const d = Math.round((now - was) / was * 100);
+    if (d === 0) return `<span class="cd">come a ${esc(prevLabel)}</span>`;
+    return `<span class="cd ${d > 0 ? "up" : "down"}">${d > 0 ? "+" : "−"}${Math.abs(d)}% rispetto a ${esc(prevLabel)}</span>`;
+  };
+  const gone = prevCat ? Object.keys(prevCat).filter(id => !byCat[id] && CAT[id]) : [];
   const catHtml = cats.length ? `<section class="block"><h2>Per categoria</h2>
       <div class="donutwrap"><canvas id="donut" aria-label="Spese per categoria"></canvas></div>
-      <ul class="catlist">${cats.map(([id,v]) => `<li><button type="button" data-act="gocat" data-cat="${id}">
-        <span class="dot" style="background:${CAT[id].color}"></span><span>${esc(CAT[id].name)}</span>
-        <span class="pct">${Math.round(v / net * 100)}%</span><span class="amt">${eur(v)}</span></button></li>`).join("")}</ul>
+      <ul class="catlist">${cats.map(([id,v], i) => `<li><button type="button" data-act="gocat" data-cat="${id}">
+        <span class="dot" style="background:${CAT[id].color}"></span><span>${esc(CAT[id].name)}${delta(id)}</span>
+        <span class="pct">${pc[i]}%</span><span class="amt">${eur(v)}</span></button></li>`).join("")}</ul>
+      ${gone.length ? `<p class="small muted" style="margin:8px 0 0">Niente questo mese in: ${gone.map(id => `${esc(CAT[id].name)} (${eur(prevCat[id])} a ${esc(prevLabel)})`).join(", ")}.</p>` : ""}
     </section>` : "";
+
+  // possibili una tantum
+  const sugg = S.movements.filter(oneoffSuggested).sort((a,b) => netOf(b) - netOf(a));
+  const suggHtml = sugg.length ? `<section class="block"><h2>Sono spese una tantum?</h2>
+      <p class="small muted" style="margin:-4px 0 8px">Una spesa una tantum resta nel totale del mese, ma non alza la media mensile.</p>
+      ${sugg.map(m => `<div class="kv" style="align-items:center">
+        <div style="min-width:0"><div style="font-weight:600">${esc(m.mer)}</div><div class="small muted">${fmtDate(m.date)}, ${esc(CAT[catOf(m)].name)}</div></div>
+        <div style="text-align:right;white-space:nowrap"><div style="font-weight:700">${eur(netOf(m))}</div>
+          <div style="display:flex;gap:6px;margin-top:4px"><button type="button" class="btn sm" data-act="oo-no" data-id="${m.id}">No</button><button type="button" class="btn sm primary" data-act="oo-yes" data-id="${m.id}">Una tantum</button></div></div>
+      </div>`).join("")}</section>` : "";
 
   // commercianti
   const byMer = {};
@@ -641,8 +777,12 @@ function renderPanoramica(ms){
       ${compare}
     </div>
     ${empty}
+    ${suggHtml}
     ${catHtml}
-    <section class="block"><h2>${UI.mode === "mese" ? "Ultimi mesi" : "Mese per mese"}</h2><div class="barwrap"><canvas id="bars" aria-label="Spesa per mese"></canvas></div>
+    <section class="block"><div class="bh"><h2>${UI.mode === "mese" ? "Ultimi mesi" : "Mese per mese"}</h2>
+      <select class="chip" data-act="barcat" aria-label="Categoria del grafico"><option value="">Tutte le categorie</option>
+        ${CATS.map(c => `<option value="${c.id}" ${UI.barCat === c.id ? "selected" : ""}>${esc(c.name)}</option>`).join("")}</select></div>
+      <div class="barwrap"><canvas id="bars" aria-label="Spesa per mese"></canvas></div>
       ${S.movements.some(isOneoff) ? `<p class="small muted" style="margin:8px 0 0">In arancio le spese una tantum.</p>` : ""}</section>
     ${merHtml}${bigHtml}${recHtml}
   </div>`;
@@ -672,13 +812,15 @@ function drawCharts(ms){
     if (UI.mode === "mese"){ labels = []; for (let k = 5; k >= 0; k--) labels.push(addMonths(UI.ym, -k)); }
     else if (UI.mode === "periodo"){ labels = []; let y = ymOf(UI.from); while (y <= ymOf(UI.to) && labels.length < 36){ labels.push(y); y = addMonths(y, 1); } }
     else labels = ms.slice();
-    const ord = labels.map(ym => r2(S.movements.filter(m => ymOf(m.date) === ym && !isOneoff(m)).reduce((s,m) => s + netOf(m), 0)));
-    const one = labels.map(ym => r2(S.movements.filter(m => ymOf(m.date) === ym && isOneoff(m)).reduce((s,m) => s + netOf(m), 0)));
+    if (UI.barCat && !CAT[UI.barCat]) UI.barCat = "";
+    const pool = UI.barCat ? S.movements.filter(m => catOf(m) === UI.barCat) : S.movements;
+    const ord = labels.map(ym => r2(pool.filter(m => ymOf(m.date) === ym && !isOneoff(m)).reduce((s,m) => s + netOf(m), 0)));
+    const one = labels.map(ym => r2(pool.filter(m => ymOf(m.date) === ym && isOneoff(m)).reduce((s,m) => s + netOf(m), 0)));
     const sel = labels.map(ym => UI.mode !== "mese" || ym === UI.ym);
     charts.push(new Chart(bc, {
       type:"bar",
       data:{ labels: labels.map(monthShort), datasets:[
-        { label:"Spese", data: ord, backgroundColor: sel.map(s => s ? acc : soft), borderRadius:4, stack:"s" },
+        { label:"Spese", data: ord, backgroundColor: sel.map(s => s ? (UI.barCat ? CAT[UI.barCat].color : acc) : soft), borderRadius:4, stack:"s" },
         { label:"Una tantum", data: one, backgroundColor: sel.map(s => s ? cssVar("--wait") : line), borderRadius:4, stack:"s" }
       ]},
       options:{ maintainAspectRatio:false, plugins:{ legend:{ display:false }, tooltip:{ callbacks:{ label: c => " " + c.dataset.label + ": " + eur(c.raw) } } },
@@ -727,6 +869,7 @@ function renderMovimenti(ms){
     <div class="filters">
       <input class="search" type="search" placeholder="Cerca un negozio, una nota…" value="${esc(UI.q)}" data-act="search" aria-label="Cerca">
       <div class="row2">
+        ${UI.cat && CAT[UI.cat] ? `<button type="button" class="chip on" data-act="clrcat" aria-label="Togli il filtro ${esc(CAT[UI.cat].name)}"><span class="dot" style="background:${CAT[UI.cat].color};width:9px;height:9px"></span>${esc(CAT[UI.cat].name)} ✕</button>` : ""}
         <select class="chip" data-act="catsel" aria-label="Categoria">
           <option value="">Tutte le categorie</option>
           ${CATS.map(c => `<option value="${c.id}" ${UI.cat === c.id ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
@@ -734,7 +877,7 @@ function renderMovimenti(ms){
         ${flts.map(([k,l]) => `<button type="button" class="chip" data-act="flt" data-f="${k}" aria-pressed="${UI.flt === k}">${l}</button>`).join("")}
       </div>
     </div>
-    <div class="summaryline">${list.length} ${list.length === 1 ? "uscita" : "uscite"}, ${eur(tot)} a tuo carico. Tocca una spesa per segnarla come ripagata.</div>
+    <div class="summaryline">${list.length} ${list.length === 1 ? "uscita" : "uscite"}${UI.cat && CAT[UI.cat] ? ` in ${esc(CAT[UI.cat].name)}` : ""}, ${eur(tot)} a tuo carico. Tocca una spesa per cambiarne categoria, nome o rimborso.</div>
     ${html || `<p class="muted">Nessuna uscita con questi filtri.</p>`}
     ${list.length > UI.limit ? `<button type="button" class="more" data-act="more">Mostra altre ${Math.min(150, list.length - UI.limit)}</button>` : ""}
   </div>`;
@@ -792,13 +935,25 @@ function renderDati(){
     </section>
     <section class="block">
       <h2>Regole di categoria</h2>
-      <p class="small muted" style="margin-top:-4px">Se il testo del movimento contiene la parola, la spesa va in quella categoria. Le crei dal dettaglio di una spesa.</p>
-      ${S.rules.length ? S.rules.map((r,i) => `<div class="rule"><span><b>${esc(r.kw)}</b> <span class="muted">va in</span> ${esc(CAT[r.cat] ? CAT[r.cat].name : r.cat)}</span>
-        <button type="button" class="x" data-act="delrule" data-i="${i}" aria-label="Elimina regola ${esc(r.kw)}">×</button></div>`).join("") : `<p class="muted small">Nessuna regola.</p>`}
+      <p class="small muted" style="margin-top:-4px">Se il testo del movimento contiene la parola, la spesa va in quella categoria. Se più regole valgono per la stessa spesa, vince la più lunga.</p>
+      ${S.rules.length ? (() => { const rs = sortedRules(); const cnt = new Map(); for (const m of S.movements){ const r = ruleFor(m, rs); if (r) cnt.set(r, (cnt.get(r) || 0) + 1); }
+        return S.rules.map((r,i) => { const n = cnt.get(r) || 0; const c = CAT[resolveCat(r.cat)]; return `<div class="rule">
+          <span style="min-width:0"><b>${esc(r.kw)}</b> <span class="muted">va in</span> <span class="dot" style="display:inline-block;width:9px;height:9px;background:${c.color}"></span> ${esc(c.name)}
+            <div class="small ${n ? "muted" : "warnt"}">${n ? `${n} ${n === 1 ? "spesa" : "spese"}` : "non prende nessuna spesa"}</div></span>
+          <span style="display:flex;gap:4px;flex:none"><button type="button" class="btn sm" data-act="r-edit" data-i="${i}">Modifica</button>
+          <button type="button" class="x" data-act="delrule" data-i="${i}" aria-label="Elimina regola ${esc(r.kw)}">×</button></span></div>`; }).join(""); })() : `<p class="muted small">Nessuna regola.</p>`}
+      <button type="button" class="btn full" style="margin-top:10px" data-act="r-new">Aggiungi regola</button>
     </section>
+    ${Object.keys(S.names).length ? `<section class="block">
+      <h2>Negozi rinominati</h2>
+      <p class="small muted" style="margin-top:-4px">Li rinomini dal dettaglio di una spesa. Tocca × per tornare al nome originale.</p>
+      ${Object.entries(S.names).sort((a,b) => a[1].localeCompare(b[1])).map(([k,v]) => `<div class="rule"><span style="min-width:0"><b>${esc(v)}</b><div class="small muted">era «${esc(k)}»</div></span>
+        <button type="button" class="x" data-act="n-del" data-k="${esc(k)}" aria-label="Ripristina il nome ${esc(k)}">×</button></div>`).join("")}
+    </section>` : ""}
     <section class="block">
       <h2>Backup</h2>
-      <p class="small muted" style="margin-top:-4px">I dati restano solo su questo telefono. Salva un backup ogni tanto su iCloud o Drive: contiene uscite, rimborsi, regole e file caricati.</p>
+      <p class="small muted" style="margin-top:-4px">I dati restano solo su questo telefono. Salva un backup ogni tanto su iCloud o Drive: contiene uscite, rimborsi, categorie, regole, nomi dei negozi e file caricati. Si apre il menu di condivisione: scegli «Salva su File» o l’app dove tenerlo.</p>
+      <div class="kv" style="margin-bottom:8px"><span>Ultimo backup</span><b>${S.lastBackup ? new Date(S.lastBackup).toLocaleDateString("it-IT") : "mai"}</b></div>
       <div class="stack">
         <button type="button" class="btn full" data-act="backup">Salva backup</button>
         <button type="button" class="btn full" data-act="restore">Ripristina da backup</button>
@@ -811,7 +966,7 @@ function renderDati(){
 /* ---------- sheet ---------- */
 let draft = null;
 function openSheet(html){ $("#sheet").innerHTML = `<div class="grab"></div>` + html; $("#overlay").hidden = false; document.body.style.overflow = "hidden"; }
-function closeSheet(){ $("#overlay").hidden = true; document.body.style.overflow = ""; draft = null; catDraft = null; }
+function closeSheet(){ $("#overlay").hidden = true; document.body.style.overflow = ""; draft = null; catDraft = null; ruleDraft = null; }
 function confirmSheet(title, text, okLabel, onOk, danger){
   openSheet(`<h3>${esc(title)}</h3><p class="muted">${esc(text)}</p>
     <div class="actions"><button type="button" class="btn" data-act="close">Annulla</button>
@@ -822,7 +977,7 @@ function confirmSheet(title, text, okLabel, onOk, danger){
 function openMovement(id){
   const m = S.movements.find(x => x.id === id); if (!m) return;
   const o = ov(m);
-  draft = { id, cat: catOf(m), rule:false, mode:"none", n:2, custom:"", state:"ricevuto", note:"", oneoff: !!o.oneoff };
+  draft = { id, cat: catOf(m), rule:false, kw: normKw(m.mer), renaming:false, newName: m.mer, mode:"none", n:2, custom:"", state:"ricevuto", note:"", oneoff: !!o.oneoff };
   if (o.reimb){
     draft.state = o.reimb.state || "ricevuto"; draft.note = o.reimb.note || "";
     if (o.reimb.split){ draft.mode = "split"; draft.n = o.reimb.split; }
@@ -841,16 +996,29 @@ function renderSheet(){
   const m = S.movements.find(x => x.id === draft.id);
   const amt = draftAmount(m);
   const modes = [["none","Nessuno"],["all","Tutto"],["split","Diviso"],["custom","Importo"]];
+  const sameName = S.movements.filter(x => x.clean === m.clean).length;
+  const src = catSource(m);
+  const ruleIdx = src.type === "rule" ? S.rules.indexOf(src.rule) : -1;
+  const srcHtml = src.type === "manual" ? `Categoria scelta da te per questa spesa.`
+    : src.type === "rule" ? `Categoria data dalla regola «<b>${esc(src.rule.kw)}</b>». <button type="button" class="linkbtn" data-act="r-edit" data-i="${ruleIdx}">Modifica regola</button>`
+    : src.type === "bank" ? `Categoria presa dalla banca: «${esc(m.bankCat)}».`
+    : `La categoria della banca («${esc(m.bankCat || "nessuna")}») non corrisponde a nessuna delle tue: finisce in ${esc(CAT.altro.name)}.`;
   openSheet(`
-    <h3>${esc(m.mer)}</h3>
+    ${draft.renaming ? `<div class="field" style="margin-top:4px"><span class="lab">Nome del negozio</span>
+        <input class="inp" maxlength="40" value="${esc(draft.newName)}" data-act="d-name" aria-label="Nuovo nome del negozio">
+        <p class="small muted" style="margin:6px 0 0">Vale per ${sameName === 1 ? "questa spesa" : `tutte le ${sameName} spese`} di «${esc(m.clean)}», anche quelle che caricherai. Dai lo stesso nome a due negozi per unirli nelle classifiche.</p>
+        <div class="actions" style="margin-top:10px"><button type="button" class="btn sm" data-act="d-rename-cancel">Annulla</button><button type="button" class="btn sm primary" data-act="d-rename-save">Salva nome</button></div></div>`
+      : `<div class="titlerow"><h3>${esc(m.mer)}</h3><button type="button" class="linkbtn" data-act="d-rename">Rinomina</button></div>`}
     <div class="muted small">${esc(dayLabel(m.date))}</div>
     <div class="gross">${eur(m.amount)}</div>
     <p class="det">${esc(m.det || m.op)}</p>
-    <p class="det">Categoria della banca: ${esc(m.bankCat || "nessuna")}</p>
 
     <div class="field"><span class="lab">Categoria</span>
       <div class="catgrid">${CATS.map(c => `<button type="button" class="chip" data-act="d-cat" data-cat="${c.id}" aria-pressed="${draft.cat === c.id}"><span class="dot" style="background:${c.color};width:9px;height:9px"></span>${esc(c.name)}</button>`).join("")}<button type="button" class="chip add" data-act="d-newcat">+ Nuova categoria</button></div>
-      <label class="check"><input type="checkbox" data-act="d-rule" ${draft.rule ? "checked" : ""}><span>Metti sempre in questa categoria le spese da «${esc(m.mer)}»</span></label>
+      <p class="det" style="margin-top:10px">${srcHtml}</p>
+      <label class="check"><input type="checkbox" data-act="d-rule" ${draft.rule ? "checked" : ""}><span>Crea una regola: metti sempre in questa categoria le spese che contengono…</span></label>
+      ${draft.rule ? `<input class="inp" style="margin-top:8px" value="${esc(draft.kw)}" data-act="d-kw" aria-label="Parola della regola" autocapitalize="characters">
+        <div class="calc" id="ruleinfo">${ruleInfo(draft.kw, draft.cat)}</div>` : ""}
     </div>
 
     <div class="field"><span class="lab">Quanto ti ridanno</span>
@@ -872,13 +1040,37 @@ function renderSheet(){
     <div class="actions"><button type="button" class="btn" data-act="close">Annulla</button><button type="button" class="btn primary" data-act="d-save">Salva</button></div>
   `);
 }
+/* quante spese prenderebbe una regola, tenendo conto che vince la più specifica */
+function ruleWins(kw, cat, skip){
+  const k = normKw(kw); if (!k) return [];
+  const rules = S.rules.filter(r => r !== skip && normKw(r.kw) !== k).concat([{ kw:k, cat }]).sort((a,b) => b.kw.length - a.kw.length);
+  return S.movements.filter(m => { const r = ruleFor(m, rules); return r && r.kw === k; });
+}
+function ruleInfo(kw, cat, skip){
+  const k = normKw(kw);
+  if (k.length < 3) return `Scrivi almeno 3 lettere.`;
+  const list = ruleWins(k, cat, skip);
+  if (!list.length) return `Per ora non prende nessuna spesa: varrà per quelle che caricherai.`;
+  const names = [...new Set(list.map(m => m.mer))];
+  return `Prende <b>${list.length} ${list.length === 1 ? "spesa" : "spese"}</b>: ${esc(names.slice(0,4).join(", "))}${names.length > 4 ? ` e altri ${names.length - 4}` : ""}.`;
+}
+/* salva una regola e toglie le scelte manuali dalle spese che prende, così vale davvero per tutte */
+function applyRule(kw, cat, old){
+  const k = normKw(kw);
+  S.rules = S.rules.filter(r => r !== old && normKw(r.kw) !== k);
+  S.rules.unshift({ kw:k, cat });
+  const list = ruleWins(k, cat);
+  for (const x of list){ const o = S.overrides[x.id]; if (o && o.cat){ delete o.cat; if (!Object.keys(o).length) delete S.overrides[x.id]; } }
+  return list.length;
+}
 function saveDraft(){
   const m = S.movements.find(x => x.id === draft.id);
+  const kw = normKw(draft.kw);
+  if (draft.rule && kw.length < 3){ toast("La parola della regola deve avere almeno 3 lettere."); return; }
+  let ruleN = null;
+  if (draft.rule) ruleN = applyRule(kw, draft.cat);
   const o = Object.assign({}, ov(m));
   if (draft.rule){
-    const kw = m.mer.toUpperCase();
-    S.rules = S.rules.filter(r => r.kw.toUpperCase() !== kw);
-    S.rules.unshift({ kw, cat: draft.cat });
     delete o.cat;
   } else {
     delete o.cat;
@@ -891,9 +1083,51 @@ function saveDraft(){
   if (draft.mode === "none" || amt <= 0) delete o.reimb;
   else o.reimb = { amount: amt, state: draft.state, note: draft.note.trim(), split: draft.mode === "split" ? draft.n : undefined };
   if (draft.oneoff) o.oneoff = true; else delete o.oneoff;
+  if (oneoffSuggested(m)) o.ooSeen = true;
   if (Object.keys(o).length) S.overrides[m.id] = o; else delete S.overrides[m.id];
   save(); closeSheet(); render();
-  toast(draft && draft.rule ? "Salvato, e regola creata" : "Salvato");
+  toast(ruleN != null ? `Salvato. La regola vale per ${ruleN} ${ruleN === 1 ? "spesa" : "spese"}` : "Salvato");
+}
+function saveRename(){
+  const m = S.movements.find(x => x.id === draft.id);
+  const v = normTxt(draft.newName);
+  if (!v || v === m.clean) delete S.names[m.clean]; else S.names[m.clean] = v;
+  refreshNames(); save();
+  draft.renaming = false; if (!draft.rule) draft.kw = normKw(m.mer);
+  renderSheet(); render(); toast("Nome aggiornato");
+}
+
+/* ---------- editor delle regole ---------- */
+let ruleDraft = null;
+function openRuleEditor(i, back){
+  const r = i != null && i >= 0 ? S.rules[i] : null;
+  ruleDraft = { rule: r, kw: r ? r.kw : "", cat: r ? resolveCat(r.cat) : "altro", back: back || null };
+  renderRuleSheet();
+}
+function renderRuleSheet(){
+  const d = ruleDraft;
+  openSheet(`<h3>${d.rule ? "Modifica regola" : "Nuova regola"}</h3>
+    <div class="field"><span class="lab">Se il testo del movimento contiene</span>
+      <input class="inp" maxlength="40" placeholder="es. ESSELUNGA" value="${esc(d.kw)}" data-act="r-kw" aria-label="Parola della regola" autocapitalize="characters">
+      <div class="calc" id="ruleinfo">${ruleInfo(d.kw, d.cat, d.rule)}</div>
+      <p class="small muted" style="margin:6px 0 0">Usa una parola che c’è in tutte le spese di quel negozio, senza città o numeri. Se più regole valgono per la stessa spesa, vince la più lunga.</p></div>
+    <div class="field"><span class="lab">Mettila in</span>
+      <div class="catgrid">${CATS.map(c => `<button type="button" class="chip" data-act="r-cat" data-cat="${c.id}" aria-pressed="${d.cat === c.id}"><span class="dot" style="background:${c.color};width:9px;height:9px"></span>${esc(c.name)}</button>`).join("")}</div></div>
+    ${d.rule ? `<button type="button" class="btn full danger" style="margin-top:20px" data-act="r-del">Elimina regola</button>` : ""}
+    <div class="actions"><button type="button" class="btn" data-act="r-cancel">Annulla</button><button type="button" class="btn primary" data-act="r-save">Salva</button></div>`);
+  if (!d.rule){ const i = $("#sheet input"); if (i) setTimeout(() => i.focus(), 50); }
+}
+function backFromRule(){
+  const back = ruleDraft && ruleDraft.back; ruleDraft = null;
+  if (back){ draft = back; const m = S.movements.find(x => x.id === draft.id); if (m) draft.cat = catOf(m); renderSheet(); render(); }
+  else { closeSheet(); render(); }
+}
+function saveRule(){
+  const d = ruleDraft, k = normKw(d.kw);
+  if (k.length < 3){ toast("La parola della regola deve avere almeno 3 lettere."); return; }
+  const n = applyRule(k, d.cat, d.rule);
+  save(); toast(`Regola salvata: vale per ${n} ${n === 1 ? "spesa" : "spese"}`);
+  backFromRule();
 }
 
 /* ---------- categorie personalizzate ---------- */
@@ -918,7 +1152,9 @@ function renderCatSheet(){
   }
   openSheet(`<h3>${d.id ? "Modifica categoria" : "Nuova categoria"}</h3>
     <div class="field"><span class="lab">Nome</span><input class="inp" maxlength="30" placeholder="es. Università" value="${esc(d.name)}" data-act="c-name" aria-label="Nome della categoria"></div>
-    <div class="field"><span class="lab">Colore</span><div class="swatches">${PALETTE.map(col => `<button type="button" class="sw" style="background:${col}" data-act="c-color" data-c="${col}" aria-pressed="${d.color === col}" aria-label="Colore ${col}"></button>`).join("")}</div></div>
+    <div class="field"><span class="lab">Colore</span><div class="swatches">${PALETTE.map(col => { const u = CATS.find(c => c.id !== d.id && c.color === col);
+        return `<button type="button" class="sw ${u ? "used" : ""}" style="background:${col}" data-act="c-color" data-c="${col}" aria-pressed="${d.color === col}" aria-label="Colore ${col}${u ? ", già usato da " + esc(u.name) : ""}" title="${u ? "Già usato da " + esc(u.name) : ""}"></button>`; }).join("")}</div>
+      ${(() => { const u = CATS.find(c => c.id !== d.id && c.color === d.color); return u ? `<p class="small warnt" style="margin:8px 0 0">Questo colore è già usato da «${esc(u.name)}»: nel grafico non si distinguono.</p>` : `<p class="small muted" style="margin:8px 0 0">I colori sbiaditi sono già usati da altre categorie.</p>`; })()}</div>
     ${d.id && d.id !== "altro" ? `<button type="button" class="btn full danger" style="margin-top:20px" data-act="c-del">Elimina categoria</button>` : ""}
     ${d.id === "altro" ? `<p class="small muted" style="margin-top:16px">«${esc(CAT.altro.name)}» raccoglie le spese senza categoria: puoi rinominarla, ma non eliminarla.</p>` : ""}
     <div class="actions"><button type="button" class="btn" data-act="c-cancel">Annulla</button><button type="button" class="btn primary" data-act="c-save">Salva</button></div>`);
@@ -966,7 +1202,7 @@ async function importFiles(files){
       const impId = "i" + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
       for (const m of res.movements){
         if (have.has(m.id)){ dup++; continue; }
-        m.mer = merchantName(m.op, m.det); m.imp = impId;
+        m.imp = impId;
         S.movements.push(m); have.add(m.id); added++;
       }
       S.imports.unshift({ id: impId, at: new Date().toISOString(), file: f.name, from: res.from, to: res.to, added, dup });
@@ -975,6 +1211,7 @@ async function importFiles(files){
       report.push({ file: f.name, error: e && e.message ? e.message : "File non leggibile." });
     }
   }
+  refreshNames();
   S.movements.sort((a,b) => b.date.localeCompare(a.date) || a.id.localeCompare(b.id));
   save();
   const ms = months(); UI.ym = ms[ms.length - 1] || null;
@@ -993,19 +1230,34 @@ async function importFiles(files){
 }
 
 /* ---------- backup ---------- */
+function markBackup(){ S.lastBackup = new Date().toISOString(); save(); if (UI.tab === "dati") render(); }
 async function doBackup(){
   const data = JSON.stringify({ app:"le-mie-uscite", version:1, exportedAt:new Date().toISOString(), ...S });
   const name = "uscite-backup-" + new Date().toISOString().slice(0,10) + ".json";
   let dl = null;
   if (window.claude && window.claude.use){ try { dl = await window.claude.use("downloads"); } catch(e){ dl = null; } }
   if (dl){
-    try { await dl.save({ filename: name, data }); toast("Backup salvato"); }
+    try { await dl.save({ filename: name, data }); markBackup(); toast("Backup salvato"); }
     catch (e) { if (e && e.code === "declined") toast("Backup annullato"); else showBackupText(data); }
     return;
   }
   if (!window.claude){
+    // 1) menu di condivisione del telefono: scegli tu dove salvarlo (File, iCloud, Drive…)
+    let file = null;
+    try { file = new File([data], name, { type:"application/json" }); } catch (e) { file = null; }
+    if (file && navigator.canShare && navigator.share && navigator.canShare({ files:[file] })){
+      try {
+        await navigator.share({ files:[file], title:"Backup Le mie uscite" });
+        markBackup(); toast("Backup condiviso: controlla di averlo salvato dove volevi"); return;
+      } catch (e) {
+        if (e && e.name === "AbortError"){ toast("Backup annullato: non è stato salvato"); return; }
+        // condivisione non riuscita: provo col download
+      }
+    }
+    // 2) riserva: download normale del browser
     const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([data], { type:"application/json" })); a.download = name;
-    document.body.appendChild(a); a.click(); a.remove(); toast("Backup salvato"); return;
+    document.body.appendChild(a); a.click(); a.remove();
+    markBackup(); toast("Backup scaricato nella cartella Download: " + name); return;
   }
   showBackupText(data);
 }
@@ -1019,8 +1271,9 @@ async function restoreBackup(file){
     const d = JSON.parse(await file.text());
     if (!d || !Array.isArray(d.movements)) throw new Error();
     confirmSheet("Ripristinare il backup?", `Contiene ${d.movements.length} uscite, salvate il ${d.exportedAt ? new Date(d.exportedAt).toLocaleDateString("it-IT") : "?"}. Sostituisce i dati attuali su questo telefono.`, "Ripristina", () => {
-      S = { movements: d.movements, overrides: d.overrides || {}, rules: d.rules || [], imports: d.imports || [], cats: d.cats || null, catRemap: d.catRemap || {} };
-      syncCats();
+      S = { movements: d.movements, overrides: d.overrides || {}, rules: d.rules || [], imports: d.imports || [], cats: d.cats || null, catRemap: d.catRemap || {},
+        names: d.names || {}, rulesV: d.rulesV || 1, colorsV: d.colorsV || 0, lastBackup: d.lastBackup || null };
+      syncCats(); migrate(); refreshNames();
       save(); closeSheet(); UI.ym = null; render(); toast("Backup ripristinato");
     });
   } catch (e) { toast("Questo file non è un backup di Le mie uscite."); }
@@ -1039,7 +1292,7 @@ document.addEventListener("click", e => {
     case "prev": { const i = ms.indexOf(UI.ym); if (i > 0){ UI.ym = ms[i-1]; render(); } break; }
     case "next": { const i = ms.indexOf(UI.ym); if (i < ms.length - 1){ UI.ym = ms[i+1]; render(); } break; }
     case "upload": $("#fileIn").click(); break;
-    case "gocat": UI.cat = el.dataset.cat; UI.flt = "tutte"; UI.tab = "movimenti"; UI.limit = 150; render(); window.scrollTo(0,0); break;
+    case "gocat": UI.cat = el.dataset.cat; UI.flt = "tutte"; UI.q = ""; UI.tab = "movimenti"; UI.limit = 150; render(); window.scrollTo(0,0); break;
     case "flt": UI.flt = el.dataset.f; UI.limit = 150; render(); break;
     case "more": UI.limit += 150; render(); break;
     case "open": openMovement(el.dataset.id); break;
@@ -1048,7 +1301,7 @@ document.addEventListener("click", e => {
     case "backup": doBackup(); break;
     case "restore": $("#backupIn").click(); break;
     case "wipe": confirmSheet("Cancellare tutti i dati?", "Elimina dal telefono uscite, rimborsi, categorie, regole e registro dei file. Se non hai un backup non potrai recuperarli.", "Cancella tutto", () => {
-      S = { movements:[], overrides:{}, rules: DEFAULT_RULES.slice(), imports:[], cats:null, catRemap:{} }; syncCats(); save(); closeSheet(); UI.ym = null; render(); toast("Dati cancellati"); }, true); break;
+      S = emptyState0(); syncCats(); save(); closeSheet(); UI.ym = null; render(); toast("Dati cancellati"); }, true); break;
     case "close": { const after = $("#sheet").dataset.after; delete $("#sheet").dataset.after; closeSheet(); if (after){ UI.tab = after; render(); window.scrollTo(0,0); } break; }
     case "confirm-ok": if (confirmSheet.cb) confirmSheet.cb(); break;
     case "d-cat": draft.cat = el.dataset.cat; renderSheet(); break;
@@ -1057,6 +1310,18 @@ document.addEventListener("click", e => {
     case "d-state": draft.state = el.dataset.s; renderSheet(); break;
     case "d-save": saveDraft(); break;
     case "d-newcat": openCatEditor(null, Object.assign({}, draft)); break;
+    case "d-rename": draft.renaming = true; draft.newName = S.movements.find(x => x.id === draft.id).mer; renderSheet(); setTimeout(() => { const i = $('[data-act="d-name"]'); if (i){ i.focus(); i.select(); } }, 50); break;
+    case "d-rename-cancel": draft.renaming = false; renderSheet(); break;
+    case "d-rename-save": saveRename(); break;
+    case "r-edit": openRuleEditor(Number(el.dataset.i), draft ? Object.assign({}, draft) : null); break;
+    case "r-new": openRuleEditor(null, null); break;
+    case "r-cat": ruleDraft.cat = el.dataset.cat; renderRuleSheet(); break;
+    case "r-save": saveRule(); break;
+    case "r-cancel": backFromRule(); break;
+    case "r-del": { const r = ruleDraft.rule; S.rules = S.rules.filter(x => x !== r); save(); toast("Regola eliminata"); backFromRule(); break; }
+    case "n-del": delete S.names[el.dataset.k]; refreshNames(); save(); render(); toast("Nome originale ripristinato"); break;
+    case "clrcat": UI.cat = ""; UI.limit = 150; render(); break;
+    case "oo-yes": case "oo-no": { const id = el.dataset.id; const o = S.overrides[id] = S.overrides[id] || {}; o.ooSeen = true; if (act === "oo-yes") o.oneoff = true; save(); render(); toast(act === "oo-yes" ? "Segnata come una tantum" : "Ok, resta una spesa normale"); break; }
     case "c-new": openCatEditor(null, null); break;
     case "c-edit": openCatEditor(el.dataset.id, null); break;
     case "c-color": catDraft.color = el.dataset.c; renderCatSheet(); break;
@@ -1080,17 +1345,23 @@ document.addEventListener("input", e => {
     if (c) c.innerHTML = `Ti ridanno <b>${eur(amt)}</b>, a tuo carico restano <b>${eur(r2(m.amount - amt))}</b>.`;
   } else if (act === "d-note"){ draft.note = e.target.value; }
   else if (act === "c-name"){ catDraft.name = e.target.value; }
+  else if (act === "d-name"){ draft.newName = e.target.value; }
+  else if (act === "d-kw" || act === "r-kw"){
+    const d = act === "d-kw" ? draft : ruleDraft; d.kw = e.target.value;
+    const box = $("#ruleinfo"); if (box) box.innerHTML = ruleInfo(d.kw, d.cat, act === "r-kw" ? ruleDraft.rule : undefined);
+  }
 });
 document.addEventListener("change", e => {
   const act = e.target.dataset && e.target.dataset.act;
   if (act === "catsel"){ UI.cat = e.target.value; UI.limit = 150; render(); }
+  else if (act === "barcat"){ UI.barCat = e.target.value; render(); }
   else if (act === "rfrom" || act === "rto"){
     const v = e.target.value; if (!v) return;
     if (act === "rfrom") UI.from = v; else UI.to = v;
     if (UI.from > UI.to){ const t = UI.from; UI.from = UI.to; UI.to = t; }
     UI.limit = 150; render();
   }
-  else if (act === "d-rule"){ draft.rule = e.target.checked; }
+  else if (act === "d-rule"){ draft.rule = e.target.checked; renderSheet(); }
   else if (act === "d-oneoff"){ draft.oneoff = e.target.checked; }
 });
 document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("#overlay").hidden) closeSheet(); });
